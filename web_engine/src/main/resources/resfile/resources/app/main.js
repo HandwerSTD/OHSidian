@@ -456,6 +456,94 @@ async function downloadUpdate(updateJson) {
 	}
 }
 
+// PDF 字体兼容补丁：arkweb 的 FontFace 不接受 CSS local() 形式的 src。
+// pdf.js 为「非内嵌字体」生成 src = `local(字体族)`，交给浏览器匹配系统字体。
+// 该构造在此处直接抛出，字体对象无法送达主线程，页面的 dependency 永远等不到，
+// 渲染停在中途，页面指示器一直处于置灰（等同加载未完成）。
+// 这里把失败的构造换成一个立即拒绝的桩对象，pdf.js 现有的 catch 会接管，
+// 转而向 worker 请求字形路径（FontFallback），渲染得以走完。
+const FONT_FACE_GUARD_SOURCE = `(() => {
+	if (window.__harmonyFontFaceGuard) return;
+	window.__harmonyFontFaceGuard = true;
+	var NativeFontFace = window.FontFace;
+	if (!NativeFontFace) return;
+	var isLocalSource = function (source) {
+		if (typeof source !== 'string') return false;
+		return source.indexOf('local(') !== -1;
+	};
+	var GuardFontFace = function (family, source, descriptors) {
+		if (!isLocalSource(source)) {
+			return new NativeFontFace(family, source, descriptors);
+		}
+		var rejection = new Promise(function (_resolve, reject) {
+			reject(new Error('本地字体不可用，已改用字形路径绘制。'));
+		});
+		// pdf.js 会 await 这个 promise，但若某条路径既不 await 也不忽略，
+		// 一个悬空的拒绝会变成未捕获异常，所以先自行接住一份。
+		rejection.catch(function () {});
+		var face = Object.create(GuardFontFace.prototype);
+		face.family = family;
+		face.status = 'error';
+		face.loaded = rejection;
+		return face;
+	};
+	GuardFontFace.prototype = Object.create(NativeFontFace.prototype);
+	GuardFontFace.prototype.constructor = NativeFontFace;
+	GuardFontFace.prototype.load = function () {
+		return this.loaded;
+	};
+	GuardFontFace.prototype.then = function (onFulfilled, onRejected) {
+		return this.loaded.then(onFulfilled, onRejected);
+	};
+	GuardFontFace.prototype.catch = function (onRejected) {
+		return this.loaded.catch(onRejected);
+	};
+	GuardFontFace.prototype.finally = function (onFinally) {
+		return this.loaded.finally(onFinally);
+	};
+	GuardFontFace.prototype.addEventListener = function () {};
+	GuardFontFace.prototype.removeEventListener = function () {};
+	Object.defineProperty(GuardFontFace.prototype, Symbol.toStringTag, {
+		configurable: true,
+		value: 'FontFace'
+	});
+	Object.setPrototypeOf(GuardFontFace, NativeFontFace);
+	window.FontFace = GuardFontFace;
+})();`;
+
+function installFontFaceGuard() {
+	if (!app || typeof app.on !== 'function') {
+		log('app.on 不可用，字体兼容补丁未安装');
+		return;
+	}
+
+	async function inject(webContents) {
+		if (!webContents) return;
+		try {
+			await webContents.executeJavaScript(FONT_FACE_GUARD_SOURCE, true);
+			log('字体兼容补丁已注入渲染进程', webContents.id);
+		} catch (e) {
+			log('字体兼容补丁注入失败', webContents.id, e && e.message ? e.message : String(e));
+		}
+	}
+
+	app.on('browser-window-created', function (event, window) {
+		let webContents = null;
+		try { webContents = window.webContents; } catch (e) {}
+		if (!webContents) return;
+		// 每次导航都会换一个全新的 JS 环境，补丁需要重新注入。
+		// 补丁脚本自身用 window.__harmonyFontFaceGuard 做了幂等处理，重复注入无害。
+		webContents.on('did-start-navigation', function () {
+			inject(webContents);
+		});
+		webContents.on('dom-ready', function () {
+			inject(webContents);
+		});
+		inject(webContents);
+	});
+	log('字体兼容补丁监听已注册');
+}
+
 function loadApp(asarPath) {
 	// Execute asar content
 	let main = path.join(asarPath, 'main.js');
@@ -575,6 +663,8 @@ process.on('uncaughtException', function (error) {
 			dialog.showErrorBox('A JavaScript error occurred in the main process', message);
 		});
 });
+
+installFontFaceGuard();
 
 // Actual startup routine
 setInterval(queueUpdate, 60 * 60 * 1000);
