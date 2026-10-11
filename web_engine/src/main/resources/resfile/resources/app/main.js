@@ -664,6 +664,63 @@ process.on('uncaughtException', function (error) {
 		});
 });
 
+// deeplink 通道：HarmonyOS 侧把 obsidian:// 链接追加写入 dataPath 下的队列文件，
+// 这里取出后交给 Obsidian 内建的 open-url 处理器。
+// ArkTS 到 Electron 主进程之间只有 ExecuteCommand 一条通道，它只覆盖窗口管理，
+// 送不进 open-url；而本版本的 Electron 也没有原生协议处理与单实例转发，
+// 所以由 ArkTS 与本文件共同完成这条链路。
+const DEEPLINK_QUEUE_FILE = 'obsidian-deeplink.pending';
+
+function readQueuedDeeplinks() {
+	let queuePath = path.join(dataPath, DEEPLINK_QUEUE_FILE);
+	let raw;
+	try {
+		if (!fs.existsSync(queuePath)) return [];
+		raw = fs.readFileSync(queuePath, 'utf8');
+		fs.unlinkSync(queuePath);
+	} catch (e) {
+		log('读取 deeplink 队列失败', e && e.message ? e.message : String(e));
+		return [];
+	}
+	return raw.split('\n')
+		.map(function (line) { return line.trim(); })
+		.filter(function (line) { return line.startsWith('obsidian://'); });
+}
+
+function dispatchDeeplink(url) {
+	// Obsidian 在 asar 加载完成后才注册 open-url 监听，
+	// 冷启动时队列里已有的链接要等到监听就绪才能派发，否则事件会被丢弃。
+	let attempts = 0;
+	let timer = setInterval(function () {
+		attempts += 1;
+		if (app.listenerCount('open-url') > 0) {
+			clearInterval(timer);
+			// 记录写在派发之前：$e 内部会同步抛出异常（例如找不到仓库），
+			// 放在派发之后记录会把这次派发整条丢掉。
+			log('正在派发 deeplink', url);
+			try {
+				app.emit('open-url', { preventDefault: function () {} }, url);
+				log('已派发 deeplink', url);
+			} catch (e) {
+				log('派发 deeplink 时抛出异常', url, e && e.stack ? e.stack : String(e));
+			}
+		} else if (attempts >= 40) {
+			clearInterval(timer);
+			log('等待 open-url 监听超时，丢弃 deeplink', url);
+		}
+	}, 250);
+}
+
+function pollDeeplinkQueue() {
+	let links = readQueuedDeeplinks();
+	if (links.length === 0) return;
+	log('从队列读到 deeplink', links.length, '条');
+	links.forEach(dispatchDeeplink);
+}
+
+pollDeeplinkQueue();
+setInterval(pollDeeplinkQueue, 500);
+
 installFontFaceGuard();
 
 // Actual startup routine

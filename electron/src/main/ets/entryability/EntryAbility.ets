@@ -35,6 +35,7 @@ import { initialize } from '@hw-agconnect/hmcore';
 import { util } from '@kit.ArkTS';
 
 import { WebAbility } from 'web_engine';
+import { DeeplinkBridge } from '../utils/DeeplinkBridge';
 
 export default class EntryAbility extends WebAbility {
   onConfigurationUpdate(config: Configuration) {
@@ -42,9 +43,27 @@ export default class EntryAbility extends WebAbility {
   }
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam) {
+    // 必须在 super 之前取：super 会把 want.uri 当作起始页面地址读走。
+    this.captureDeeplink(want);
     super.onCreate(want, launchParam);
     // 初始化华为 AGC 云服务
     this.initAgc();
+  }
+
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam) {
+    super.onNewWant(want, launchParam);
+    this.captureDeeplink(want);
+  }
+
+  private captureDeeplink(want: Want): void {
+    let url = DeeplinkBridge.extractAndStrip(want);
+    if (url === undefined) {
+      return;
+    }
+    // 必须用 applicationContext 的目录：UIAbilityContext.filesDir 带模块前缀
+    // （haps/electron/files），而 Electron 的 userData 是应用级目录（files），
+    // 两者在磁盘上是两个不同的位置。
+    DeeplinkBridge.enqueue(this.context.getApplicationContext().filesDir, url);
   }
 
   private async initAgc(): Promise<void> {

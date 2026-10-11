@@ -40,7 +40,11 @@
               "action.system.home",
               "ohos.want.action.viewData"
             ],
-            "uris": []
+            "uris": [
+              {
+                "scheme": "obsidian"
+              }
+            ]
           }
         ],
       },
