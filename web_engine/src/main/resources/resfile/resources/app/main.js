@@ -25,6 +25,29 @@ if (remote && typeof remote.initialize === 'function') {
 	remote.initialize();
 }
 
+// remote 的开启状态记录在 @electron/remote 主进程侧的一个 WeakMap 里，键是 WebContents。
+// asar 里的窗口接线只覆盖它自己用 BrowserWindow 建立的窗口。1.13.4 把设置页改成
+// window.open 打开的弹出窗口（vault 配置 settingsPopoutWindow 默认开启），
+// 这类窗口的渲染进程在刚建立时就会同步调用 remote.getCurrentWindow()，
+// 而窗口侧接线要等到 did-create-window 才执行，之间有一段空档，
+// 于是抛出「@electron/remote is disabled for this WebContents」。
+// 在创建事件里立刻开启，这个时刻早于该 WebContents 上的任何渲染进程脚本。
+// webview 里的页面不受信任，保持关闭。
+app.on('web-contents-created', function (event, contents) {
+	if (!contents || !remote || typeof remote.enable !== 'function') {
+		return;
+	}
+	try {
+		if (typeof contents.getType === 'function' && contents.getType() === 'webview') {
+			return;
+		}
+		remote.enable(contents);
+		log('[HMOS-REMOTE] 已开启 remote，WebContents ' + contents.id + ' 类型 ' + (typeof contents.getType === 'function' ? contents.getType() : '未知'));
+	} catch (e) {
+		console.warn('[HMOS-REMOTE] 为 WebContents 开启 remote 失败', contents.id, e);
+	}
+});
+
 protocol.registerSchemesAsPrivileged([
 	{scheme: 'app', privileges: {standard: true, secure: true, supportFetchAPI: true, stream: true, codeCache: true}}
 ]);
