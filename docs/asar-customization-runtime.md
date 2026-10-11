@@ -647,8 +647,14 @@ i18n 的 7 个键（6.1）、zh.txt 的 4 块（6.2）。写法已实测确定�
 
 以下几项在实施前需要确认。已由实测排除的项不再列出（设备 Electron 主版本、官方 asar 能否加载、外层注入能否执行、remote 能否开启）。
 
-1. **`window.require('obsidian')` 返回的模块是否含全部所需类。** 这个标识符是 webpack 模块内的闭包变量，用文本与语法树分析都没定位到绑定。若不成立，改用 1.3 节给出的取法：从 `window.app.setting.settingTabs` 取已有项，用 `Object.getPrototypeOf` 拿基类；`Setting` 类从已渲染的设置项取得。
-2. **设置页注入的刷新步骤。** `Setting.prototype.addSettingTab` 内部立即调用 `e.update()`，而 `update()` 做 `this.settingItems=this.getSettingDefinitions()`，结果在 App 构造期间就被算出并缓存。外部包装 `getSettingDefinitions` 之后必须再调一次 `tab.update()`，否则渲染的是旧缓存。
-3. **`[HMOS-FRAME]` 的前置条件。** 官方那段代码里 `t` 取自 `ipcRenderer.sendSync("frame")`，而 `D.frame` 由渲染进程自己写回。注入脚本要复现这段，需先弄清谁在何时设置 `D.frame`，否则 `"native"!==t` 可能判错。
-4. **i18n 包装在真实页面里的表现。** 已用官方 `lib/i18next.min.js` 与官方的 `Up`、`Kp` 转换函数单独实测通过，未在页面内实测。
-5. **三项窗口复用在运行时有无替代做法。** 见第 9 节。
+以下四项已在设备上实测完成，见 `docs/runtime-inject-verification.md` 第 9 节：
+
+- `window.require('obsidian')` 在设备上抛 `Cannot find module 'obsidian'`。官方把模块实例放在闭包里，未注册为 require 可解析的模块。设置页基类只能从原型链回溯（`app.setting.settingTabs[0]`）。
+- 设置页注入后的刷新步骤：包装 `getSettingDefinitions` 后调 `tab.update()` 生效，实测已注册 10 个页签。
+- `[HMOS-FRAME]` 的前置条件：设备上 `ipcRenderer.sendSync("frame")` 返回 `hidden`，该分支被执行；`setWindowButtonVisibility` 接口存在。
+- i18n 包装在真实页面里的表现：`i18next.t 已包装`。
+
+剩下未验证的：
+
+1. **三项窗口复用在运行时有无替代做法。** 见第 9 节。
+2. **`disable-update` 恒返回 true 对「自动更新」开关的影响。** 渲染进程读该通道的返回值为真时，开关显示为关闭；用户拨动开关时也走该通道，但写入被忽略。需要实测确认这是否符合预期（当前自动更新本来就由外层 `queueUpdate` 短路，开关仅影响界面状态）。

@@ -146,12 +146,102 @@ function WJ(e){
 - 探针需要自己实现写入，因为 `log()` 在其后定义。
 - 探针要放在 `app.on('web-contents-created')` 注册之前，或者注册在 asar 加载之前，才能保证时序上早于官方。
 
-## 8. 未验证事项
+## 8. 全量注入的实测记录
 
-以下仍未验证，只是静态分析：
+第 3 节到第 7 节是最小验证（只改 asar 与两处注入）。本节是一次完整注入的实测，范围覆盖 `docs/asar-customization-runtime.md` 里判为「运行时注入」的全部项目。
 
-- 设置页注入能否生效。`Setting.prototype.addSettingTab` 内部立即调用 `e.update()`，而 `update()` 做 `this.settingItems=this.getSettingDefinitions()`，结果在 App 构造期间就被算出并缓存。外部包装 `getSettingDefinitions` 之后必须再调一次 `tab.update()`。
-- `window.require('obsidian')` 返回什么。它是 webpack 模块内的闭包变量，用文本与语法树分析都没定位到绑定。回退取法（从 `window.app.setting.settingTabs[0]` 用 `Object.getPrototypeOf` 取基类）不依赖它。
-- i18n 包装在真实页面里的表现。已用官方 `lib/i18next.min.js` 与官方的 `Up`、`Kp` 转换函数单独实测通过，未在页面内实测。
-- `[HMOS-FRAME]` 的判据。官方那段代码里 `t` 取自 `ipcRenderer.sendSync("frame")`，而 `D.frame` 由渲染进程自己写回，注入脚本需要先弄清谁在何时设置它。
-- 三项窗口复用（help 复用 starter、starter 复用为仓库窗口、打开最近仓库时复用 starter）在运行时没有等价接口。
+### 8.1 改动内容
+
+外层 `web_engine/src/main/resources/resfile/resources/app/main.js` 增加：窗口登记、托盘初始化、关窗到托盘、十二个 `hcs-*` 通道注册、`exit-to-tray` 与 `force-quit` 通道、`disable-update` 覆盖、渲染进程注入注册、渲染进程日志转写通道、`before-quit` 标记。
+
+新增 `inject/` 目录：
+
+| 文件 | 内容 |
+|------|------|
+| `hcs-channels.js` | 十二个华为云同步通道的工厂函数，由外层调用后注册 |
+| `preload.js` | 最早时机：屏蔽 `window.close`、包装 `i18next.t` |
+| `dom-ready.js` | 页面结构就绪后：设置页注入、标题栏文字、文档标题、窗口按钮与右边距、起始窗口样式 |
+
+资源：`tray.png`（314843 字节）放到 asar 之外，与 `obsidian.asar` 同目录。
+
+asar 保持官方 1.13.4 原版。实测 md5 `bbae59d36fe60500436a82cb841d5ad6`，25783388 字节，380 个文件，唯一含关键字的是官方自带的 `icon.png`；`hcs-login`、`huawei-cloud-sync`、`OHsidian`、`qtray`、`exit-to-tray`、`[HMOS-FRAME]`、`harmonyos-sync-bridge` 的命中数都是 0。
+
+### 8.2 实测结果
+
+一轮启动的日志（时间戳 UTC）：
+
+```
+[PROBE] 版本改写：真实值 5.0.0-Release -> 现值 18.0.0
+字体兼容补丁监听已注册
+华为云同步通道已注册 12 个
+退出相关通道已注册
+已屏蔽 installer 版本提示
+Loaded main app package /data/storage/el1/bundle/electron/resources/resfile/resources/app/obsidian.asar
+HarmonyOS port: desktop auto-update is disabled
+[PROBE] WebContents 1 类型 window：remote 开启前 false 开启后 true
+托盘已初始化 /data/storage/el1/bundle/electron/resources/resfile/resources/app/tray.png
+[INJECT] preload 开始施加
+[INJECT] window.close 已屏蔽
+注入脚本已施加 preload.js WebContents 1 类型 vault
+[INJECT] dom-ready 注入开始
+注入脚本已施加 dom-ready.js WebContents 1 类型 vault
+[INJECT] 窗口按钮与右边距已调整，frame=hidden setWindowButtonVisibility=true --frame-right-space=126px
+[INJECT] i18next.t 已包装
+[INJECT] 华为云同步页已注册，基类 t，取法 prototype，已存在页数 10
+[INJECT] 设置页注入结束；外观页=true 关于页=true，页签数 10，页签 id=about,appearance,interface,editor,file,hotkeys,keychain,plugins,community-plugins,huawei-cloud-sync
+```
+
+### 8.3 新确认的结论
+
+**`window.require('obsidian')` 在设备上抛 `Cannot find module 'obsidian'`。** 完整报错是：
+
+```
+[INJECT] 读 window.require("obsidian") 抛错 Cannot find module 'obsidian'
+Require stack:
+- electron/js2c/renderer_init
+```
+
+官方把模块实例放在闭包里，未注册为 require 可解析的模块。所以 `docs/asar-customization-runtime.md` 第 1.3 节给出的回退取法是唯一可用的取法。同时 `Setting` 与 `Notice` 也不能从该模块取：`Notice` 由官方挂在 `window` 上（源码里是 `window.Notice=xw`），直接从 `window` 取即可。
+
+**设置页基类从原型链回溯可行。** `Object.getPrototypeOf(app.setting.settingTabs[0]).constructor` 取到基类，注册后页签列表从 9 个变为 10 个，末尾是 `huawei-cloud-sync`。`Setting` 容器的 `isPluginSettingTab` 用 `instanceof` 判定，因此这个类必须真的继承内部基类，回溯得到的正是该基类。
+
+**包装 `getSettingDefinitions` 后调 `tab.update()` 生效。** 外观页与关于页的包装返回值都是 `true`。
+
+**`[HMOS-FRAME]` 的两件事在运行时可以做到。** `ipcRenderer.sendSync("frame")` 返回 `hidden`，`electron.remote.getCurrentWindow().setWindowButtonVisibility` 接口存在且可调用，`--frame-right-space` 设为 `126px` 生效。
+
+**i18next 包装生效。** 日志记录 `i18next.t 已包装`。包装前用官方 `lib/i18next.min.js` 单独实测过：键的形态是 kebab-case 且以 `setting.about.` 开头（例如 `setting.about.label-version`），命中自定义键返回改写值，未命中的键交给官方实现处理。
+
+### 8.4 首轮注入发现的两处缺陷
+
+首轮完整注入后做了一次独立核对，发现两处真实缺陷，均已修正并重新实测。
+
+**一、两个设置页的包装在第一个分组就返回。**
+
+1.13.4 的「外观」页与「关于」页都是混合结构：部分设置项平铺，后面跟若干 `type:"group"` 的分组。「外观」页的两个分组依次是「字体」与「高级」，「半透明效果」在「高级」里；「关于」页的分组依次是「账号」与「高级」。
+
+原代码遍历到第一个分组就 `return`，因此「退出软件」开关被插进「字体」分组，「贡献作者」被插进「账号」分组。修正后改为遍历全部分组再定位。
+
+实测日志：
+
+```
+外观页已插入退出软件开关；所在分组=高级 位置=1 该分组项名=自定义应用图标|退出软件
+关于页已插入贡献作者条目；前四项名=HarmonyOS-|贡献作者|自动更新|接收内部版本
+```
+
+**二、`removeAllListeners` 的执行时机错误。**
+
+`installDisableUpdate()` 原本在 `loadApp()` 之前调用，而官方的同名监听是在 `loadApp()` 里注册的。先清空再注册，官方随后的注册变成第二个监听器，`sendSync` 通道上多个监听器时结果不可预测。
+
+修正后移到 `loadApp()` 之后。官方全部通道里只有 `disable-update` 一个与注入重名（其余十四个官方都是 0 次命中），因此只有这一项受影响。
+
+实测日志：
+
+```
+disable-update 被调用，参数 （读取）
+```
+
+### 8.5 仍未验证
+
+- **三项窗口复用**（help 复用 starter、starter 复用为仓库窗口、打开最近仓库时复用 starter）在运行时没有等价接口。当前保留官方行为。
+- **`disable-update` 恒返回 `true` 对「自动更新」开关的影响。** 渲染进程读该通道的返回值为真时开关显示为关闭，用户拨动开关时写入被忽略。需要确认这符合预期：自动更新本来就由外层 `queueUpdate` 短路，开关只影响界面状态。另一条做法是在 `preload.js` 里同样改写渲染进程的 `process.versions.electron` 到 `29.0.0`，使官方的 `qy(pf, "28.2.3")` 判定为假，该通道即恢复官方行为。这条依赖 `preload.js` 早于 `app.js` 求值，需要一轮实测确认。
+- **界面项**：托盘图标显示、「华为云同步」页内容、「退出软件」开关、「关于」页的版本与贡献作者条目、起始窗口标题栏文字、PDF 渲染、`obsidian://` 派发。这些需要看着界面确认。
