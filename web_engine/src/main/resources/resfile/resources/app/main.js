@@ -21,6 +21,80 @@ try {
 }
 let {app, protocol, net} = electron;
 
+// 最小验证探针。obsidian.log 由第 280 行的 log() 写入，而探针需要在其之前执行，
+// 因此这里自备一套写入，格式与 log() 一致（UTC 时间戳）。
+let __probePath = path.join(app.getPath('userData'), 'obsidian.log');
+function probe() {
+	try {
+		let d = new Date();
+		let p2 = function (n) { return n < 10 ? '0' + n : '' + n; };
+		let ts = d.getUTCFullYear() + '-' + p2(d.getUTCMonth() + 1) + '-' + p2(d.getUTCDate()) +
+			' ' + p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()) + ':' + p2(d.getUTCSeconds());
+		let args = Array.prototype.slice.call(arguments);
+		fs.appendFileSync(__probePath, ts + ' [PROBE] ' + util.format.apply(null, args) + os.EOL);
+	} catch (e) {
+		// 探针失败不影响启动
+	}
+}
+
+// 最小验证：官方 asar 的入口会读 process.versions.electron，主版本低于 18 时弹出
+// 「Manual update required」并退出。该属性只读，改写需用 Object.defineProperty。
+// 改写只作用于主进程。
+let __realElectronVersion = process.versions.electron;
+try {
+	Object.defineProperty(process.versions, 'electron', {
+		value: '18.0.0', writable: true, configurable: true, enumerable: true
+	});
+	probe('版本改写：真实值 %s -> 现值 %s', __realElectronVersion, process.versions.electron);
+} catch (e) {
+	probe('版本改写失败：%s', e && e.message ? e.message : String(e));
+}
+
+// 最小验证：1.13.4 的设置页默认在独立窗口打开，其渲染进程建立后立即同步调用
+// remote.getCurrentWindow()，而 asar 内部要到 did-create-window 才开启 remote。
+// 在 WebContents 创建时立即开启，早于该 WebContents 上的任何渲染进程脚本。
+// 本函数注册于 asar 加载之前，因此比 asar 自己注册的同类监听先执行。
+let __remoteDiag = null;
+try {
+	// 必须直接引 server.js：dist/src/main/index.js 只转发 initialize、isInitialized、enable
+	// 三个导出，不含诊断用的 isRemoteModuleEnabled。
+	// server.js 正是 enable 的定义处，与第 11 行的 require('@electron/remote/main')
+	// 解析到同一个模块实例（main/index.js -> ../dist/src/main -> ./server）。
+	__remoteDiag = require('@electron/remote/dist/src/main/server');
+} catch (e) {
+	probe('无法载入 remote 诊断模块：%s', e && e.message ? e.message : String(e));
+}
+
+app.on('web-contents-created', function (event, contents) {
+	if (!contents) {
+		return;
+	}
+	let type = typeof contents.getType === 'function' ? contents.getType() : '未知';
+	let before = null;
+	try {
+		before = __remoteDiag ? __remoteDiag.isRemoteModuleEnabled(contents) : null;
+	} catch (e) {}
+	if (!remote || typeof remote.enable !== 'function') {
+		probe('WebContents %s 类型 %s：remote.enable 不可用', contents.id, type);
+		return;
+	}
+	if (type === 'webview') {
+		// 与官方 asar 的处理保持一致：webview 不受信任，不开启。
+		probe('WebContents %s 类型 %s：跳过（webview）', contents.id, type);
+		return;
+	}
+	try {
+		remote.enable(contents);
+		let after = null;
+		try {
+			after = __remoteDiag ? __remoteDiag.isRemoteModuleEnabled(contents) : null;
+		} catch (e) {}
+		probe('WebContents %s 类型 %s：remote 开启前 %s 开启后 %s', contents.id, type, before, after);
+	} catch (e) {
+		probe('WebContents %s 类型 %s：remote.enable 抛错 %s', contents.id, type, e && e.message ? e.message : String(e));
+	}
+});
+
 if (remote && typeof remote.initialize === 'function') {
 	remote.initialize();
 }
