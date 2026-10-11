@@ -19,7 +19,7 @@ try {
 		electron.remote = remote;
 	}
 }
-let {app, protocol, net} = electron;
+let {app, protocol, net, Tray, Menu, BrowserWindow} = electron;
 
 // 最小验证探针。obsidian.log 由第 280 行的 log() 写入，而探针需要在其之前执行，
 // 因此这里自备一套写入，格式与 log() 一致（UTC 时间戳）。
@@ -130,6 +130,47 @@ let APP_PATH = (() => {
 let currentBaseVersion = require('./package.json').version || app.getVersion();
 let currentPackageVersion = currentBaseVersion;
 let dataPath = app.getPath('userData');
+
+// 托盘与关窗到托盘的状态。
+// exitToTrayEnabled 与渲染进程「设置 → 外观 → 退出软件」开关对应，默认开启：
+// 开关的初始值取 localStorage 的 exit-to-tray，缺省时视为开启，两处默认值必须一致。
+// quitRequested 用于区分「关窗」与「真正退出」，before-quit 触发时置为 true。
+let exitToTrayEnabled = true;
+let quitRequested = false;
+let trayIcon = null;
+
+// 已创建的窗口。托盘菜单与「显示」菜单项需要一个可聚焦的窗口。
+// 键是窗口 id，值是 BrowserWindow。窗口关闭时移除。
+let knownWindows = new Map();
+
+// 窗口类别由 URL 判定。1.13.4 的三种页面：仓库窗口 index.html、
+// 起始窗口 starter.html、帮助窗口 help.html。设置弹窗走 about:blank。
+function windowKind(webContents) {
+	let url = '';
+	try {
+		url = webContents.getURL() || '';
+	} catch (e) {
+		return 'unknown';
+	}
+	if (url.indexOf('index.html') >= 0) return 'vault';
+	if (url.indexOf('starter.html') >= 0) return 'starter';
+	if (url.indexOf('help.html') >= 0) return 'help';
+	if (url === 'about:blank' || url === '') return 'popup';
+	return 'unknown';
+}
+
+// 托盘与「显示」菜单项作用的目标窗口：优先仓库窗口，其次任意已登记窗口。
+function focusedWindow() {
+	for (let w of knownWindows.values()) {
+		try {
+			if (windowKind(w.webContents) === 'vault') return w;
+		} catch (e) {}
+	}
+	for (let w of knownWindows.values()) {
+		return w;
+	}
+	return null;
+}
 
 function itemExists(filePath) {
 	try {
@@ -585,12 +626,96 @@ const FONT_FACE_GUARD_SOURCE = `(() => {
 	window.FontFace = GuardFontFace;
 })();`;
 
+// 窗口登记。托盘菜单需要一个可操作的目标窗口。
+function registerWindow(window) {
+	knownWindows.set(window.id, window);
+	window.on('closed', function () {
+		knownWindows.delete(window.id);
+	});
+}
+
+// 托盘。官方 1.13.4 不含任何托盘代码，这一整项都是本项目的定制。
+// 图标放在 asar 之外（与 obsidian.asar 同目录），避开写 asar 的成本。
+function installTray() {
+	if (trayIcon) return trayIcon;
+	let iconPath = path.join(APP_PATH, 'tray.png');
+	if (!fs.existsSync(iconPath)) {
+		log('托盘图标不存在，跳过托盘初始化', iconPath);
+		return null;
+	}
+	try {
+		trayIcon = new Tray(iconPath);
+	} catch (e) {
+		log('托盘初始化失败', e && e.message ? e.message : String(e));
+		return null;
+	}
+	let toggle = function () {
+		let w = focusedWindow();
+		if (!w) return;
+		try {
+			if (w.isVisible()) w.hide(); else w.show();
+		} catch (e) {}
+	};
+	try {
+		trayIcon.on('click', toggle);
+	} catch (e) {}
+	try {
+		trayIcon.setToolTip('OHsidian');
+	} catch (e) {}
+	try {
+		trayIcon.setContextMenu(Menu.buildFromTemplate([
+			{
+				label: '显示',
+				click: function () {
+					let w = focusedWindow();
+					if (!w) return;
+					try {
+						if (w.isMinimized()) w.restore();
+						w.show();
+						w.focus();
+					} catch (e) {}
+				}
+			},
+			{
+				label: '退出软件',
+				click: function () {
+					quitRequested = true;
+					try { trayIcon.destroy(); } catch (e) {}
+					trayIcon = null;
+					app.quit();
+				}
+			}
+		]));
+	} catch (e) {
+		log('托盘菜单设置失败', e && e.message ? e.message : String(e));
+	}
+	log('托盘已初始化', iconPath);
+	return trayIcon;
+}
+
+// 关窗到托盘。只拦截仓库窗口；起始窗口与帮助窗口保持官方的关闭行为。
+// 官方的关闭处理器在事件上设了 3 秒后的销毁定时器，它会在那时读
+// defaultPrevented，我们提前 preventDefault 即可让它不再销毁。
+function installCloseToTray(window) {
+	window.on('close', function (event) {
+		if (quitRequested || !exitToTrayEnabled) return;
+		let kind = 'unknown';
+		try { kind = windowKind(window.webContents); } catch (e) {}
+		if (kind !== 'vault') return;
+		event.preventDefault();
+		try {
+			window.hide();
+		} catch (e) {
+			try { window.minimize(); } catch (e2) {}
+		}
+	});
+}
+
 function installFontFaceGuard() {
 	if (!app || typeof app.on !== 'function') {
 		log('app.on 不可用，字体兼容补丁未安装');
 		return;
 	}
-
 	async function inject(webContents) {
 		if (!webContents) return;
 		try {
@@ -605,6 +730,8 @@ function installFontFaceGuard() {
 		let webContents = null;
 		try { webContents = window.webContents; } catch (e) {}
 		if (!webContents) return;
+		registerWindow(window);
+		installCloseToTray(window);
 		// 每次导航都会换一个全新的 JS 环境，补丁需要重新注入。
 		// 补丁脚本自身用 window.__harmonyFontFaceGuard 做了幂等处理，重复注入无害。
 		webContents.on('did-start-navigation', function () {
@@ -612,10 +739,107 @@ function installFontFaceGuard() {
 		});
 		webContents.on('dom-ready', function () {
 			inject(webContents);
+			injectRenderer(webContents);
 		});
 		inject(webContents);
 	});
 	log('字体兼容补丁监听已注册');
+}
+
+// 注入渲染进程的脚本。与字体补丁同样挂三个时机：
+// 每次导航都是全新的 JS 环境，脚本自身用标志位做幂等。
+// 两个文件分别是：
+//   preload.js    最早的时机。覆盖 window.close，包装 i18next。
+//   dom-ready.js  页面结构就绪后施加。设置页、标题、样式、窗口按钮。
+const RENDERER_SCRIPTS = ['preload.js', 'dom-ready.js'];
+
+function injectRenderer(webContents) {
+	if (!webContents) return;
+	let kind = 'unknown';
+	try { kind = windowKind(webContents); } catch (e) {}
+	// 设置弹窗与帮助窗口不需要设置页注入，但它们也不排斥。
+	// 这里全部注入，脚本内部自己判定。
+	for (let name of RENDERER_SCRIPTS) {
+		let file = path.join(APP_PATH, 'inject', name);
+		let source;
+		try {
+			source = fs.readFileSync(file, 'utf8');
+		} catch (e) {
+			log('注入脚本读取失败', name, e && e.message ? e.message : String(e));
+			continue;
+		}
+		webContents.executeJavaScript(source, true).then(function () {
+			log('注入脚本已施加', name, 'WebContents', webContents.id, '类型', kind);
+		}, function (e) {
+			log('注入脚本施加失败', name, 'WebContents', webContents.id, e && e.message ? e.message : String(e));
+		});
+	}
+}
+
+// 十二个华为云同步通道。先移除同名监听再注册，
+// 避免与 asar 内可能存在的实现重复响应（sendSync 同一通道多个监听时
+// 以先 returnValue 者为准，重复注册会让行为不可预测）。
+function installHcsChannels() {
+	let build;
+	try {
+		build = require('./inject/hcs-channels.js');
+	} catch (e) {
+		log('华为云同步通道模块载入失败', e && e.message ? e.message : String(e));
+		return;
+	}
+	let channels = build(fs, path, dataPath);
+	for (let [name, handler] of channels) {
+		electron.ipcMain.removeAllListeners(name);
+		electron.ipcMain.on(name, handler);
+	}
+	log('华为云同步通道已注册', channels.length, '个');
+}
+
+// 退出相关通道。官方 1.13.4 不含这三个通道。
+// exit-to-tray 的读写与「设置 → 外观 → 退出软件」开关对应：
+// 开关默认开启，与渲染进程侧 localStorage 缺省值一致。
+function installExitChannels() {
+	electron.ipcMain.removeAllListeners('exit-to-tray');
+	electron.ipcMain.on('exit-to-tray', function (event, value) {
+		if (value !== undefined) {
+			exitToTrayEnabled = !!value;
+		}
+		event.returnValue = exitToTrayEnabled;
+	});
+	// force-quit 由托盘菜单的「退出软件」与设置页的退出按钮使用。
+	electron.ipcMain.removeAllListeners('force-quit');
+	electron.ipcMain.on('force-quit', function () {
+		quitRequested = true;
+		exitToTrayEnabled = false;
+		try { if (trayIcon) trayIcon.destroy(); } catch (e) {}
+		trayIcon = null;
+		app.quit();
+	});
+	log('退出相关通道已注册');
+}
+
+// 渲染进程的日志转写通道。渲染进程没有写文件的接口，
+// 注入脚本用它把诊断输出写进 obsidian.log（console.log 在设备上不可见）。
+function installLogChannel() {
+	electron.ipcMain.on('ohsidian-log', function (event, message) {
+		log('[INJECT]', message);
+	});
+}
+
+// 屏蔽 installer 版本过低的提示与下载入口。
+// 渲染进程侧的比较是 qy(process.versions.electron, "28.2.3")，
+// 设备上的 Electron 是 5.0.0-Release，结果恒为真。
+// 官方判定处会先读这个通道，返回真时跳过提示。
+function installDisableUpdate() {
+	electron.ipcMain.removeAllListeners('disable-update');
+	electron.ipcMain.on('disable-update', function (event, value) {
+		// 记录调用参数：用于确认渲染进程是否还在发起这个判断。
+		// 官方启动时的判断是 qy(process.versions.electron, "28.2.3")，
+		// 若渲染进程侧的版本改写生效，这个通道就不会再被调用。
+		log('disable-update 被调用，参数', value === undefined ? '（读取）' : String(value));
+		event.returnValue = true;
+	});
+	log('已屏蔽 installer 版本提示');
 }
 
 function loadApp(asarPath) {
@@ -797,6 +1021,27 @@ setInterval(pollDeeplinkQueue, 500);
 
 installFontFaceGuard();
 
+// 下面四项必须在 asar 加载之后注册。
+// 其中的 removeAllListeners 用于清掉官方自己注册的同名监听；
+// 官方的注册发生在 loadApp() 调用 module.exports 时，
+// 因此在本位置之前调用会先清空一个不存在的监听，官方随后的注册就变成第二个监听器了。
+// sendSync 通道上多个监听器时以先设置 returnValue 者为准，结果不可预测。
+
+// 真正退出时置标志，让关窗拦截放行。
+// 官方自己也有一个 before-quit 监听（设置它自己的退出标志），两者互不干扰。
+app.on('before-quit', function () {
+	quitRequested = true;
+});
+
+// 托盘要在 app ready 之后创建，否则 Electron 会报
+// "Cannot create Tray before app is ready"。
+// 延迟 1 秒是为了等窗口先出现，托盘菜单的「显示」需要目标窗口。
+app.whenReady().then(function () {
+	setTimeout(function () {
+		installTray();
+	}, 1000);
+});
+
 // Actual startup routine
 setInterval(queueUpdate, 60 * 60 * 1000);
 
@@ -849,6 +1094,12 @@ if (!success) {
 if (!success) {
 	log('Failed to load both app packages.');
 }
+
+// asar 已加载，此时覆盖同名通道可以真正取代官方的实现。
+installHcsChannels();
+installExitChannels();
+installLogChannel();
+installDisableUpdate();
 
 queueUpdate();
 updateEvents.on('check', () => queueUpdate(true));
